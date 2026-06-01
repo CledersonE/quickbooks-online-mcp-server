@@ -1,0 +1,346 @@
+name: Layer 3 MCP Security Scan
+
+# Two-gate package/image scanning for the QuickBooks Online MCP (fork-model POC).
+#   Gate 1 (source): Syft+Grype deps, Trivy fs (vuln+secret+misconfig+license). dev-deps included.
+#   Gate 2 (image):  build the (fork-added) Dockerfile, Syft SBOM, Grype (SBOM), Trivy image.
+#   report:          aggregate both gates into one sticky PR comment.
+# Public repo -> SARIF code scanning works (no GHAS needed). Report-only (no build gate enforced).
+
+on:
+  push:
+    branches:
+      - ce_feat/layer3_scan
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write   # SARIF upload (public repo -> free)
+
+env:
+  COMPONENT_PATH: .
+  DOCKERFILE: Dockerfile
+  IMAGE_REF: qbo-mcp:${{ github.sha }}
+  ENABLE_SARIF: ${{ vars.ENABLE_SARIF || 'true' }}
+
+jobs:
+  gate1-source:
+    name: Gate 1 — source/repo scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syft — SBOM of source deps (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ env.COMPONENT_PATH }}
+          format: cyclonedx-json
+          output-file: sbom-source.cdx.json
+          artifact-name: sbom-source-qbo-cyclonedx
+          upload-artifact: true
+
+      - name: Grype — scan source SBOM (report-only)
+        uses: anchore/scan-action@v7
+        with:
+          sbom: ./sbom-source.cdx.json
+          by-cve: true
+          output-format: json
+          output-file: grype-source.json
+          fail-build: false
+
+      - name: Trivy — fs scan JSON (vuln+secret+misconfig+license, incl dev-deps)
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_INCLUDE_DEV_DEPS: 'true'
+        with:
+          scan-type: fs
+          scan-ref: ${{ env.COMPONENT_PATH }}
+          scanners: vuln,secret,misconfig,license
+          format: json
+          output: trivy-source.json
+          exit-code: '0'
+
+      - name: Trivy — fs table report
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_INCLUDE_DEV_DEPS: 'true'
+        with:
+          scan-type: fs
+          scan-ref: ${{ env.COMPONENT_PATH }}
+          scanners: vuln,secret,misconfig,license
+          format: table
+          output: trivy-source-report.txt
+          exit-code: '0'
+
+      - name: Build Gate 1 summary + comment fragment
+        run: |
+          G=grype-source.json; T=trivy-source.json; S=sbom-source.cdx.json
+          gsev() { jq --arg s "$1" '[.matches[]? | select(.vulnerability.severity==$s)] | length' "$G"; }
+          g_total=$(jq '(.matches // []) | length' "$G"); g_crit=$(gsev Critical); g_high=$(gsev High)
+          g_fix=$(jq '[.matches[]? | select((.vulnerability.severity=="Critical" or .vulnerability.severity=="High") and .vulnerability.fix.state=="fixed")]|length' "$G")
+          t_total=$(jq '[.Results[]?.Vulnerabilities[]?.VulnerabilityID]|unique|length' "$T")
+          t_crit=$(jq '[.Results[]?.Vulnerabilities[]?|select(.Severity=="CRITICAL").VulnerabilityID]|unique|length' "$T")
+          t_high=$(jq '[.Results[]?.Vulnerabilities[]?|select(.Severity=="HIGH").VulnerabilityID]|unique|length' "$T")
+          t_sec=$(jq '[.Results[]?.Secrets[]?]|length' "$T")
+          t_mis=$(jq '[.Results[]?.Misconfigurations[]?]|length' "$T")
+          t_lic=$(jq '[.Results[]?.Licenses[]?]|length' "$T")
+          deps=$(jq '[.components[]? | select(.type=="library")] | length' "$S")
+          jq -r '.matches[]? | select(.vulnerability.severity=="Critical" or .vulnerability.severity=="High")
+            | "| \(.vulnerability.severity) | [\(.vulnerability.id)](\(.vulnerability.dataSource // "")) | \(.artifact.name) | \(.artifact.version) | \(.vulnerability.fix.state // "n/a") |"' "$G" | sort > g1-detail.md
+          {
+            echo "### 📁 Gate 1 — Source scan (repo root, ${deps} deps incl dev)"
+            echo ""
+            echo "| Tool | Vulns | Critical | High | Other |"
+            echo "|---|---|---|---|---|"
+            echo "| Grype (deps) | $g_total | $g_crit | $g_high | fixable C/H: **$g_fix** |"
+            echo "| Trivy (fs) | $t_total | $t_crit | $t_high | secrets $t_sec · misconfig $t_mis · license $t_lic |"
+            echo ""
+            if [ "$t_sec" -gt 0 ]; then echo "> 🚨 **$t_sec secret(s) detected in source — investigate before building.**"; echo ""; fi
+            if [ "$t_mis" -gt 0 ]; then echo "> ⚠️ $t_mis IaC/Dockerfile misconfiguration(s)."; echo ""; fi
+            echo "<details><summary>🔎 Grype source — CRITICAL/HIGH ($((g_crit + g_high)))</summary>"
+            echo ""
+            echo "| Severity | CVE | Package | Installed | Fix state |"
+            echo "|---|---|---|---|---|"
+            cat g1-detail.md
+            echo ""
+            echo "</details>"
+          } | tee gate1-comment.md >> "$GITHUB_STEP_SUMMARY"
+          echo "Gate1: grype=$g_total(c$g_crit/h$g_high) trivy=$t_total secrets=$t_sec misconfig=$t_mis"
+
+      - name: Trivy — fs SARIF
+        if: env.ENABLE_SARIF == 'true'
+        env:
+          TRIVY_INCLUDE_DEV_DEPS: 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ env.COMPONENT_PATH }}
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-source.sarif
+          exit-code: '0'
+
+      - name: Upload Trivy fs SARIF
+        if: env.ENABLE_SARIF == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-source.sarif
+          category: qbo-source
+
+      - name: Upload Gate 1 results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate1-results-qbo
+          path: |
+            grype-source.json
+            trivy-source.json
+            trivy-source-report.txt
+            gate1-comment.md
+
+  gate2-image:
+    name: Gate 2 — image scan
+    needs: gate1-source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build QuickBooks MCP image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_REF }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Syft — SBOM of image (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_REF }}
+          format: cyclonedx-json
+          output-file: sbom-image.cdx.json
+          artifact-name: sbom-image-qbo-cyclonedx
+          upload-artifact: true
+
+      - name: Grype — scan image SBOM (report-only)
+        uses: anchore/scan-action@v7
+        with:
+          sbom: ./sbom-image.cdx.json
+          by-cve: true
+          output-format: json
+          output-file: grype-image.json
+          fail-build: false
+
+      - name: Trivy — image scan JSON (vuln+secret+misconfig+license)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          scanners: vuln,secret,misconfig,license
+          format: json
+          output: trivy-image.json
+          exit-code: '0'
+
+      - name: Trivy — image table report
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          scanners: vuln,secret,misconfig,license
+          format: table
+          output: trivy-image-report.txt
+          exit-code: '0'
+
+      - name: Build Gate 2 summary + comment fragment
+        run: |
+          G=grype-image.json; T=trivy-image.json; S=sbom-image.cdx.json
+          gsev() { jq --arg s "$1" '[.matches[]? | select(.vulnerability.severity==$s)] | length' "$G"; }
+          g_total=$(jq '(.matches // []) | length' "$G"); g_crit=$(gsev Critical); g_high=$(gsev High)
+          g_fix=$(jq '[.matches[]? | select((.vulnerability.severity=="Critical" or .vulnerability.severity=="High") and .vulnerability.fix.state=="fixed")]|length' "$G")
+          t_total=$(jq '[.Results[]?.Vulnerabilities[]?.VulnerabilityID]|unique|length' "$T")
+          t_crit=$(jq '[.Results[]?.Vulnerabilities[]?|select(.Severity=="CRITICAL").VulnerabilityID]|unique|length' "$T")
+          t_high=$(jq '[.Results[]?.Vulnerabilities[]?|select(.Severity=="HIGH").VulnerabilityID]|unique|length' "$T")
+          t_sec=$(jq '[.Results[]?.Secrets[]?]|length' "$T")
+          t_mis=$(jq '[.Results[]?.Misconfigurations[]?]|length' "$T")
+          t_lic=$(jq '[.Results[]?.Licenses[]?]|length' "$T")
+          libs=$(jq '[.components[]? | select(.type=="library")] | length' "$S")
+          jq -r '.matches[]? | select(.vulnerability.severity=="Critical" or .vulnerability.severity=="High")
+            | "| \(.vulnerability.severity) | [\(.vulnerability.id)](\(.vulnerability.dataSource // "")) | \(.artifact.name) | \(.artifact.version) | \(.vulnerability.fix.state // "n/a") | \((.vulnerability.fix.versions // []) | join(", ")) |"' "$G" | sort > g2-grype-detail.md
+          jq -r '.Results[]?.Vulnerabilities[]?|select(.Severity=="CRITICAL" or .Severity=="HIGH")
+            | "| \(.Severity) | [\(.VulnerabilityID)](\(.PrimaryURL // "")) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "n/a") |"' "$T" | sort -u > g2-trivy-detail.md
+          {
+            echo "### 📦 Gate 2 — Image scan (\`${IMAGE_REF}\`, ${libs} packages)"
+            echo ""
+            echo "| Tool | Total | Critical | High | Other |"
+            echo "|---|---|---|---|---|"
+            echo "| Grype (via SBOM) | $g_total | $g_crit | $g_high | fixable C/H: **$g_fix** |"
+            echo "| Trivy (image) | $t_total | $t_crit | $t_high | secrets $t_sec · misconfig $t_mis · license $t_lic |"
+            echo ""
+            if [ "$g_fix" -gt 0 ]; then
+              echo "> ⚠️ **Gate preview:** $g_fix fixable CRITICAL/HIGH — would FAIL if enforced (report-only)."
+            else
+              echo "> ✅ **Gate preview:** no fixable CRITICAL/HIGH."
+            fi
+            echo ""
+            echo "<details><summary>🔎 Grype image — CRITICAL/HIGH ($((g_crit + g_high)))</summary>"
+            echo ""
+            echo "| Severity | CVE | Package | Installed | Fix state | Fixed in |"
+            echo "|---|---|---|---|---|---|"
+            cat g2-grype-detail.md
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "<details><summary>🔎 Trivy image — CRITICAL/HIGH ($((t_crit + t_high)))</summary>"
+            echo ""
+            echo "| Severity | CVE | Package | Installed | Fixed in |"
+            echo "|---|---|---|---|---|"
+            cat g2-trivy-detail.md
+            echo ""
+            echo "</details>"
+          } | tee gate2-comment.md >> "$GITHUB_STEP_SUMMARY"
+          echo "Gate2: grype=$g_total(c$g_crit/h$g_high fix$g_fix) trivy=$t_total license=$t_lic"
+
+      - name: Grype — image SARIF
+        if: env.ENABLE_SARIF == 'true'
+        uses: anchore/scan-action@v7
+        with:
+          sbom: ./sbom-image.cdx.json
+          by-cve: true
+          output-format: sarif
+          output-file: grype-image.sarif
+          fail-build: false
+
+      - name: Upload Grype image SARIF
+        if: env.ENABLE_SARIF == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: grype-image.sarif
+          category: qbo-image-grype
+
+      - name: Trivy — image SARIF
+        if: env.ENABLE_SARIF == 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: '0'
+
+      - name: Upload Trivy image SARIF
+        if: env.ENABLE_SARIF == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: qbo-image-trivy
+
+      - name: Upload Gate 2 results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate2-results-qbo
+          path: |
+            grype-image.json
+            trivy-image.json
+            trivy-image-report.txt
+            gate2-comment.md
+
+  report:
+    name: PR comment (both gates)
+    needs: [gate1-source, gate2-image]
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Gate 1 results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: gate1-results-qbo
+          path: g1
+
+      - name: Download Gate 2 results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: gate2-results-qbo
+          path: g2
+
+      - name: Assemble comment
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          {
+            echo "## 🛡️ Layer 3 MCP security scan — QuickBooks Online MCP"
+            echo ""
+            echo "Two-gate scan (source → image) · report-only · fork of \`intuit/quickbooks-online-mcp-server\`."
+            echo ""
+            if [ -f g1/gate1-comment.md ]; then cat g1/gate1-comment.md; else echo "_Gate 1 produced no output._"; fi
+            echo ""
+            if [ -f g2/gate2-comment.md ]; then cat g2/gate2-comment.md; else echo "_Gate 2 did not run (Gate 1 may have blocked it)._"; fi
+            echo ""
+            echo "📦 SBOMs, JSON, and Trivy table reports are in the [run artifacts]($run_url)."
+          } > scan-comment.md
+
+      - name: Upsert PR sticky comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- mcp-layer3-scan:qbo -->';
+            const body = marker + '\n' + fs.readFileSync('scan-comment.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
